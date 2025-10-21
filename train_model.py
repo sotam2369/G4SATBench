@@ -4,6 +4,7 @@ import torch.optim as optim
 import os
 import sys
 import argparse
+import csv
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 from g4satbench.utils.options import add_model_options
@@ -13,6 +14,8 @@ from g4satbench.utils.format_print import FormatTable
 from g4satbench.data.dataloader import get_dataloader
 from g4satbench.models.gnn import GNN
 from torch_scatter import scatter_sum
+from g4satbench.utils.folder_manager import SGATFolder
+import numpy as np
 
 
 def main():
@@ -39,6 +42,7 @@ def main():
     parser.add_argument('--lr_patience', type=int, default=10, help='Learning rate patience')
     parser.add_argument('--clip_norm', type=float, default=1.0, help='Clipping norm')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument('--out_dir', type=str, default=None, help='Base output directory for runs (overrides runs/)')
 
     add_model_options(parser)
 
@@ -56,10 +60,27 @@ def main():
         exp_name = f'train_task={opts.task}_difficulty={difficulty}_dataset={dataset}_splits={splits_name}/' + \
             f'graph={opts.graph}_init_emb={opts.init_emb}_model={opts.model}_n_iterations={opts.n_iterations}_lr={opts.lr:.0e}_weight_decay={opts.weight_decay:.0e}_seed={opts.seed}'
     
-    if opts.checkpoint is not None:
-        opts.log_dir = os.path.abspath(os.path.join(opts.checkpoint, '../../', exp_name))
+    if opts.out_dir is not None:
+        base_root = opts.out_dir
     else:
-        opts.log_dir = os.path.join('runs', exp_name)
+        base_root = 'runs'
+
+    # If a custom out_dir was provided, always root the experiment there. Only when
+    # no out_dir is provided do we preserve the old behavior of deriving the base
+    # from the checkpoint path when resuming.
+    if opts.out_dir is None and opts.checkpoint is not None:
+        base_log_dir = os.path.abspath(os.path.join(opts.checkpoint, '../../', exp_name))
+    else:
+        base_log_dir = base_root
+
+    # Create a per-run folder train_1, train_2, ... inside the experiment folder
+    run_idx = 1
+    while True:
+        cand = os.path.join(base_log_dir, f'train_{run_idx}')
+        if not os.path.exists(cand):
+            opts.log_dir = cand
+            break
+        run_idx += 1
 
     opts.checkpoint_dir = os.path.join(opts.log_dir, 'checkpoints')
 
@@ -85,6 +106,19 @@ def main():
 
         model.load_state_dict(checkpoint['state_dict'], strict=False)
 
+    # Initialize SGATFolder to manage outputs (logs, plots, csvs, best/last models)
+    out_dir_param = opts.out_dir if opts.out_dir is not None else None
+    work_folder = SGATFolder(directory=out_dir_param or '../plots/', b_weights=[1.0])
+    # Set opts.log_dir and checkpoint_dir to the folder_manager path
+    opts.log_dir = str(work_folder.folder_path)
+    opts.checkpoint_dir = os.path.join(opts.log_dir, 'checkpoints')
+    os.makedirs(opts.checkpoint_dir, exist_ok=True)
+
+    # Replace manual logger with folder-managed log file
+    opts.log = os.path.join(opts.log_dir, 'log.txt')
+    sys.stdout = Logger(opts.log, sys.stdout)
+    sys.stderr = Logger(opts.log, sys.stderr)
+
     optimizer = optim.Adam(model.parameters(), lr=opts.lr, weight_decay=opts.weight_decay)
     train_loader = get_dataloader(opts.train_dir, opts.train_splits, opts.train_sample_size, opts, 'train')
 
@@ -106,11 +140,23 @@ def main():
         format_table = FormatTable()
 
     best_loss = float('inf')
+    # histories for plotting/csv
+    train_loss_history = []
+    valid_loss_history = []
+    train_eval_history = []
+    valid_eval_history = []
+    # track sum of per-instance satisfied-clause ratios (for unweighted average across problems)
+    train_ratio_sum = 0.0
+    valid_ratio_sum = 0.0
     for epoch in range(opts.epochs):
         print('EPOCH #%d' % epoch)
         print('Training...')
         train_loss = 0
-        train_cnt = 0
+        # per-epoch ratio accumulators (sum of per-instance ratios)
+        train_ratio_sum = 0.0
+        valid_ratio_sum = 0.0
+        train_sat_sum = 0.0
+        train_cnt = 0  # number of fully satisfied instances (legacy)
         train_tot = 0
 
         if opts.task == 'satisfiability' or opts.task == 'core_variable':
@@ -168,8 +214,16 @@ def main():
                 v_assign = (v_pred > 0.5).float()
                 l_assign = torch.stack([v_assign, 1 - v_assign], dim=1).reshape(-1)
                 c_sat = torch.clamp(scatter_sum(l_assign[l_edge_index], c_edge_index, dim=0, dim_size=c_size), max=1)
-                sat_batch = (scatter_sum(c_sat, c_batch, dim=0, dim_size=batch_size) == data.c_size).float()
-
+                # per-instance satisfied clause counts (0..num_clauses)
+                sat_counts = scatter_sum(c_sat, c_batch, dim=0, dim_size=batch_size).float()
+                train_sat_sum += sat_counts.sum().item()
+                # accumulate per-instance satisfied-clause ratios (sat_counts / per-instance clause counts)
+                try:
+                    train_ratio_sum += (sat_counts / data.c_size.float()).sum().item()
+                except Exception:
+                    # fallback: if data.c_size isn't a tensor or shape mismatch, approximate by total
+                    train_ratio_sum += sat_counts.sum().item() / (c_size if c_size > 0 else 1)
+                sat_batch = (sat_counts == data.c_size).float()
                 train_cnt += sat_batch.sum().item()
             
             else:
@@ -194,20 +248,32 @@ def main():
             format_table.print_stats()
         else:
             assert opts.task == 'assignment'
-            train_acc = train_cnt / train_tot
+            # average satisfied clauses per instance for training
+            train_avg_sat = train_sat_sum / train_tot if train_tot > 0 else 0.0
+            train_acc = train_cnt / train_tot if train_tot > 0 else 0.0
+            # average satisfied-clauses ratio (unweighted average over problems)
+            train_avg_sat_ratio = train_ratio_sum / train_tot if train_tot > 0 else 0.0
             print('Training accuracy: %f' % train_acc)
+            print('Training avg_satisfied_clauses: %f' % train_avg_sat)
+            print('Training avg_satisfied_clauses_ratio: %f' % train_avg_sat_ratio)
 
-        if epoch % opts.save_model_epochs == 0:
-            torch.save({
-                'state_dict': model.state_dict(),
-                'epoch': epoch,
-                'optimizer': optimizer.state_dict()},
-                os.path.join(opts.checkpoint_dir, 'model_%d.pt' % epoch)
-            )
+        # append histories
+        train_loss_history.append(train_loss)
+        # valid_loss may not be set yet; append placeholder to keep lengths
+        # valid_loss appended later after validation completes
+
+        # if epoch % opts.save_model_epochs == 0:
+        #     torch.save({
+        #         'state_dict': model.state_dict(),
+        #         'epoch': epoch,
+        #         'optimizer': optimizer.state_dict()},
+        #         os.path.join(opts.checkpoint_dir, 'model_%d.pt' % epoch)
+        #     )
 
         if opts.valid_dir is not None:
             print('Validating...')
             valid_loss = 0
+            valid_sat_sum = 0.0
             valid_cnt = 0
             valid_tot = 0
 
@@ -265,7 +331,14 @@ def main():
                         v_assign = (v_pred > 0.5).float()
                         l_assign = torch.stack([v_assign, 1 - v_assign], dim=1).reshape(-1)
                         c_sat = torch.clamp(scatter_sum(l_assign[l_edge_index], c_edge_index, dim=0, dim_size=c_size), max=1)
-                        sat_batch = (scatter_sum(c_sat, c_batch, dim=0, dim_size=batch_size) == data.c_size).float()
+                        sat_counts = scatter_sum(c_sat, c_batch, dim=0, dim_size=batch_size).float()
+                        valid_sat_sum += sat_counts.sum().item()
+                        # accumulate per-instance satisfied-clause ratios
+                        try:
+                            valid_ratio_sum += (sat_counts / data.c_size.float()).sum().item()
+                        except Exception:
+                            valid_ratio_sum += sat_counts.sum().item() / (c_size if c_size > 0 else 1)
+                        sat_batch = (sat_counts == data.c_size).float()
                         valid_cnt += sat_batch.sum().item()
                     
                     else:
@@ -286,27 +359,69 @@ def main():
             if opts.task == 'satisfiability' or opts.task == 'core_variable':
                 format_table.print_stats()
             else:
+
                 assert opts.task == 'assignment'
-                valid_acc = valid_cnt / valid_tot
+                valid_acc = valid_cnt / valid_tot if valid_tot > 0 else 0.0
+                valid_avg_sat = valid_sat_sum / valid_tot if valid_tot > 0 else 0.0
+                # average satisfied-clauses ratio (unweighted average over problems)
+                valid_avg_sat_ratio = valid_ratio_sum / valid_tot if valid_tot > 0 else 0.0
                 print('Validating accuracy: %f' % valid_acc)
+                print('Validating avg_satisfied_clauses: %f' % valid_avg_sat)
+                print('Validating avg_satisfied_clauses_ratio: %f' % valid_avg_sat_ratio)
 
-            if valid_loss < best_loss:
-                best_loss = valid_loss
-                torch.save({
-                    'state_dict': model.state_dict(),
-                    'epoch': epoch,
-                    'optimizer': optimizer.state_dict()},
-                    os.path.join(opts.checkpoint_dir, 'model_best.pt')
-                )
+            # append validation histories (use satisfied-clause ratio as eval for assignment)
+            valid_loss_history.append(valid_loss)
+            if opts.task == 'assignment':
+                # compute epoch-level train ratio (unweighted average across problems)
+                train_avg_sat_ratio = train_ratio_sum / train_tot if train_tot > 0 else 0.0
+                train_eval_history.append(train_avg_sat_ratio)
+                valid_eval_history.append(valid_avg_sat_ratio)
+            else:
+                train_eval_history.append(train_acc if 'train_acc' in locals() else None)
+                valid_eval_history.append(valid_acc if 'valid_acc' in locals() else None)
 
+            # Use folder_manager to potentially update best model and save plots/csvs
+            try:
+                # save best/last model using appropriate metric (satisfied-clause ratio for assignment)
+                if opts.task == 'assignment':
+                    metric_tensor = torch.tensor(valid_avg_sat_ratio)
+                else:
+                    metric_tensor = torch.tensor(valid_acc if 'valid_acc' in locals() else 0.0)
+                work_folder.save_model(model, metric_tensor, epoch)
+            except Exception:
+                # fallback: save raw state dicts
+                torch.save({'state_dict': model.state_dict(), 'epoch': epoch, 'optimizer': optimizer.state_dict()}, os.path.join(opts.checkpoint_dir, f'model_{epoch}.pt'))
+
+        else:
+            # no validation; still append placeholders
+            valid_loss = None
+            valid_loss_history.append(valid_loss)
+            if opts.task == 'assignment':
+                train_eval_history.append(train_avg_sat_ratio if 'train_avg_sat_ratio' in locals() else None)
+            else:
+                train_eval_history.append(train_acc if 'train_acc' in locals() else None)
+            valid_eval_history.append(None)
+        # Scheduler step
+        if opts.valid_dir is not None:
             if opts.scheduler is not None:
                 if opts.scheduler == 'ReduceLROnPlateau':
-                    scheduler.step(valid_loss)
+                    scheduler.step(valid_loss if valid_loss is not None else 0.0)
                 else:
                     scheduler.step()
         else:
             if opts.scheduler is not None:
                 scheduler.step()
+
+        # Now save plots and csvs using folder_manager
+        try:
+            import numpy as _np
+            work_folder.save_plot([_np.array(train_loss_history), _np.array([v for v in valid_loss_history if v is not None])], ['Train', 'Test'], 'loss')
+            work_folder.save_plot([_np.array(train_eval_history), _np.array([v for v in valid_eval_history if v is not None])], ['Train', 'Test'], 'eval', add_border=max)
+            # save_csv expects lists of lists
+            work_folder.save_csv([train_loss_history], [ [v if v is not None else None for v in valid_loss_history] ], 'loss')
+            work_folder.save_csv([train_eval_history], [ [v if v is not None else None for v in valid_eval_history] ], 'eval')
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

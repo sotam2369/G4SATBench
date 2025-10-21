@@ -6,7 +6,6 @@ import math
 from g4satbench.models.mlp import MLP
 from g4satbench.models.ln_lstm_cell import LayerNormBasicLSTMCell
 from torch_scatter import scatter_sum, scatter_mean
-from kmeans_pytorch import kmeans
 
 
 class NeuroSAT(nn.Module):
@@ -435,6 +434,64 @@ class GIN_VCG(nn.Module):
 
         return v_embs, c_embs
 
+class MS_ESFG(nn.Module):
+    def __init__(self, opts):
+        super(MS_ESFG, self).__init__()
+        self.opts = opts
+        self.dim = opts.dim
+        self.n_mlp_layers = opts.n_mlp_layers
+        self.activation = opts.activation
+
+        # Aggregation functions for variables to clauses (positive and negative separately)
+        self.aggl_pos = MLP(self.n_mlp_layers, self.dim, self.dim, self.dim, self.activation)
+        self.aggl_neg = MLP(self.n_mlp_layers, self.dim, self.dim, self.dim, self.activation)
+
+        # Aggregation functions for clauses to variables (positive and negative separately)
+        self.aggc_pos = MLP(self.n_mlp_layers, self.dim, self.dim, self.dim, self.activation)
+        self.aggc_neg = MLP(self.n_mlp_layers, self.dim, self.dim, self.dim, self.activation)
+
+        # Clause and variable update modules
+        self.clause_upd = nn.GRUCell(self.dim * 2, self.dim)
+        self.variable_upd = nn.GRUCell(self.dim * 2, self.dim)
+
+        # Readout layer to generate assignments
+        self.readout = MLP(self.n_mlp_layers, self.dim, self.dim, 1, self.activation)
+
+    def forward(self, v_size, c_size, v_edge_index, c_edge_index, p_edge_index, n_edge_index, v_emb, c_emb):
+        # VCG-style message passing:
+        # v_edge_index: [num_edges] - variable indices for each edge
+        # c_edge_index: [num_edges] - clause indices for each edge
+        # p_edge_index: indices of positive edges (in edge arrays)
+        # n_edge_index: indices of negative edges (in edge arrays)
+        v_embs, c_embs = [v_emb], [c_emb]
+
+        for _ in range(self.opts.n_iterations):
+            # Variable to clause messages (positive and negative separately)
+            v_msg_pos = self.aggl_pos(v_emb)[v_edge_index[p_edge_index]]
+            v_msg_neg = self.aggl_neg(v_emb)[v_edge_index[n_edge_index]]
+            # Aggregate to clauses
+            v2c_aggr_pos = scatter_sum(v_msg_pos, c_edge_index[p_edge_index], dim=0, dim_size=c_size)
+            v2c_aggr_neg = scatter_sum(v_msg_neg, c_edge_index[n_edge_index], dim=0, dim_size=c_size)
+            v2c_aggr = torch.cat([v2c_aggr_pos, v2c_aggr_neg], dim=1)
+
+            # Clause to variable messages (positive and negative separately)
+            c_msg_pos = self.aggc_pos(c_emb)[c_edge_index[p_edge_index]]
+            c_msg_neg = self.aggc_neg(c_emb)[c_edge_index[n_edge_index]]
+            # Aggregate to variables
+            c2v_aggr_pos = scatter_sum(c_msg_pos, v_edge_index[p_edge_index], dim=0, dim_size=v_size)
+            c2v_aggr_neg = scatter_sum(c_msg_neg, v_edge_index[n_edge_index], dim=0, dim_size=v_size)
+            c2v_aggr = torch.cat([c2v_aggr_pos, c2v_aggr_neg], dim=1)
+
+            # Clause update
+            c_emb = self.clause_upd(v2c_aggr, c_emb)
+            c_embs.append(c_emb)
+
+            # Variable update
+            v_emb = self.variable_upd(c2v_aggr, v_emb)
+            v_embs.append(v_emb)
+
+        return v_embs, c_embs
+
 
 class GNN_VCG(nn.Module):
     def __init__(self, opts):
@@ -450,6 +507,8 @@ class GNN_VCG(nn.Module):
             self.gnn = GCN_VCG(self.opts)
         elif self.opts.model == 'gin':
             self.gnn = GIN_VCG(self.opts)
+        elif self.opts.model == 'ms_esfg':
+            self.gnn = MS_ESFG(self.opts)
         
         if self.opts.task == 'satisfiability':
             self.g_readout = MLP(self.opts.n_mlp_layers, self.opts.dim, self.opts.dim, 1, self.opts.activation)

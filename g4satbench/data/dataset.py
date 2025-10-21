@@ -6,7 +6,9 @@ import itertools
 
 from torch_geometric.data import Dataset
 from g4satbench.utils.utils import parse_cnf_file, clean_clauses
-from g4satbench.data.data import construct_lcg, construct_vcg
+from g4satbench.data.data import construct_lcg, construct_vcg, LCG, VCG
+from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr
+from torch_geometric.data.storage import GlobalStorage
 
 
 class SATDataset(Dataset):
@@ -145,7 +147,15 @@ class SATDataset(Dataset):
                 label = self.all_labels[split][idx]
                 file_name = self._get_file_name(split, cnf_filepath)
                 saved_path = os.path.join(self.processed_dir, file_name)
-                data = torch.load(saved_path)
+                # Allowlist G4SATBench Data classes for safe unpickling when
+                # torch.load defaults to weights_only=True (PyTorch >=2.6).
+                try:
+                    with torch.serialization.safe_globals([VCG, LCG, DataEdgeAttr, DataTensorAttr, GlobalStorage]):
+                        data = torch.load(saved_path)
+                except AttributeError:
+                    # Older PyTorch may not have safe_globals; fall back to
+                    # loading without the context (may require trusting file).
+                    data = torch.load(saved_path)
                 data.y = label
                 if self.use_contrastive_learning:
                     data.positive_index = self.positive_indices[split_idx]
@@ -161,6 +171,10 @@ class SATDataset(Dataset):
                     label = self.all_labels[split][idx]
                     file_name = self._get_file_name(split, cnf_filepath)
                     saved_path = os.path.join(self.processed_dir, file_name)
-                    data = torch.load(saved_path)
+                    try:
+                        with torch.serialization.safe_globals([VCG, LCG, DataEdgeAttr, DataTensorAttr, GlobalStorage]):
+                            data = torch.load(saved_path)
+                    except AttributeError:
+                        data = torch.load(saved_path)
                     data.y = label
                     return [data]
